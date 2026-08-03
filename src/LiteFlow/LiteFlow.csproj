@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>LiteFlow</RootNamespace>
+    <AssemblyName>LiteFlow</AssemblyName>
+    <PackageId>LiteFlow</PackageId>
+    <Description>Durable workflow engine on PostgreSQL: a workflow is a sequence of tracked steps, each step applied transactionally, resumed at the exact step it was on after a crash. Built on LiteQueue.</Description>
+    <Authors>clemkd</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <!--
+    The tests re-dispatch a step message by hand to prove the cursor guard drops it, which needs the
+    internal dispatcher and catalog. Nothing else is exposed.
+  -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="LiteFlow.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" />
+    <PackageReference Include="Npgsql" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+  </ItemGroup>
+
+  <!--
+    Step dispatch, leases, heartbeats and the fenced acknowledge come from LiteQueue (clemkd/LiteQueue).
+    Referenced as a sibling repo checkout during co-development; publish LiteQueue to a NuGet feed and
+    switch this to a <PackageReference> for a standalone/CI build.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\LiteQueue\src\LiteQueue\LiteQueue.csproj" />
+  </ItemGroup>
+
+</Project>

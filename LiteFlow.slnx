@@ -1,0 +1,18 @@
+<Solution>
+  <Folder Name="/aspire/">
+    <Project Path="aspire/LiteFlow.AppHost/LiteFlow.AppHost.csproj" />
+    <Project Path="aspire/LiteFlow.ServiceDefaults/LiteFlow.ServiceDefaults.csproj" />
+  </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/LiteFlow.Benchmarks/LiteFlow.Benchmarks.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/LiteFlow.Console/LiteFlow.Console.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/LiteFlow/LiteFlow.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/LiteFlow.Tests/LiteFlow.Tests.csproj" />
+  </Folder>
+</Solution>

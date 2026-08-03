@@ -1,0 +1,23 @@
+## .NET
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+.vs/
+
+## Rider / VS Code
+.idea/
+.vscode/
+
+## Aspire / local
+**/aspire-manifest.json
+*.log
+
+## BenchmarkDotNet generated artifacts
+BenchmarkDotNet.Artifacts/
+**/BenchmarkDotNet.Artifacts/
+
+## Test / coverage output
+**/TestResults/
