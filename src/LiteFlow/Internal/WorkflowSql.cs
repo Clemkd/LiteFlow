@@ -26,9 +26,10 @@ namespace LiteFlow.Internal;
 /// </summary>
 internal sealed class WorkflowSql
 {
-    public WorkflowSql(string schema)
+    public WorkflowSql(string schema, string queueSchema)
     {
         Schema = schema;
+        QueueSchema = queueSchema;
 
         const string columns =
             """
@@ -317,37 +318,65 @@ internal sealed class WorkflowSql
              LIMIT @max
              """;
 
-        // Instances that should have a message in flight but have not moved for a while. Re-dispatching
-        // is a no-op when the message is still there (its dedup key collides), so this can run blind.
-        OrphanCandidates =
+        // Reconciliation: for every live instance that has *no message in flight*, find out why, by
+        // looking at the queue rather than by guessing.
+        //
+        // An earlier version re-dispatched every idle instance blindly, on the theory that the dedup key
+        // made it a no-op when a message still existed. That theory was wrong twice over. A dead-lettered
+        // message has *released* its dedup key, so re-dispatching gave a step that had already thrown its
+        // way through its whole attempt budget a fresh budget — the workflow carried on after a definitive
+        // failure. And an instance whose message was merely queued behind a busy fleet was counted as a
+        // failed re-dispatch on every tick, until it was parked while its step had never failed at all.
+        //
+        // So: the candidate set is exactly the instances with nothing in flight (an index probe on the
+        // queue's unique dedup index), and each one is classified by whether a dead letter explains it.
+        // A dead letter newer than the instance's last progress is a verdict — never a reason to retry.
+        // Anything else is genuinely lost work, and only that is re-dispatched.
+        //
+        // State 2 (WaitingSignal) is excluded: having no message is its normal condition, not a symptom.
+        ReconcileCandidates =
             $"""
-             UPDATE {schema}.workflows SET redispatch_count = redispatch_count + 1, updated_at = now()
-             WHERE id IN (
-                 SELECT id FROM {schema}.workflows
-                 WHERE state = 0
-                   AND updated_at < now() - make_interval(secs => @grace)
-                   AND redispatch_count < @max_redispatch
-                 ORDER BY updated_at
+             WITH candidate AS (
+                 SELECT w.id, w.definition, w.state, w.current_step, w.current_step_name, w.priority,
+                        w.compensation_index, w.redispatch_count, w.updated_at
+                 FROM {schema}.workflows w
+                 WHERE w.state IN (0, 1, 3)
+                   AND NOT EXISTS (
+                         SELECT 1 FROM {queueSchema}.messages m
+                         WHERE m.dedup_key = replace(w.id::text, '-', '') || ':' || w.current_step
+                            OR (w.compensation_index IS NOT NULL
+                                AND m.dedup_key =
+                                    replace(w.id::text, '-', '') || ':c' || w.compensation_index)
+                       )
+                 ORDER BY w.updated_at
                  LIMIT @max
                  FOR UPDATE SKIP LOCKED
              )
-             RETURNING id, definition, current_step, current_step_name, priority, redispatch_count
+             SELECT DISTINCT ON (c.id)
+                    c.id, c.definition, c.state, c.current_step, c.current_step_name, c.priority,
+                    c.compensation_index, c.redispatch_count,
+                    c.updated_at < now() - make_interval(secs => @grace) AS redispatchable,
+                    d.dedup_key, d.error, d.attempts
+             FROM candidate c
+             LEFT JOIN {queueSchema}.dead_letters d
+                    ON (d.dedup_key = replace(c.id::text, '-', '') || ':' || c.current_step
+                        OR (c.compensation_index IS NOT NULL
+                            AND d.dedup_key =
+                                replace(c.id::text, '-', '') || ':c' || c.compensation_index))
+                   -- Older than the instance's last progress means it belongs to a previous life of this
+                   -- step (it was resumed since), so it is history rather than a verdict.
+                   AND d.failed_at > c.updated_at
+             ORDER BY c.id, d.failed_at DESC NULLS LAST
              """;
 
-        ExhaustedRedispatch =
+        // Counted only when a message was really put back, so an instance whose step is simply queued
+        // behind a busy fleet can never be parked for it.
+        BumpRedispatch =
             $"""
-             UPDATE {schema}.workflows SET
-                 state = 7,
-                 error = COALESCE(error, @error),
-                 updated_at = now(),
-                 completed_at = now()
-             WHERE id IN (
-                 SELECT id FROM {schema}.workflows
-                 WHERE state = 0
-                   AND updated_at < now() - make_interval(secs => @grace)
-                   AND redispatch_count >= @max_redispatch
-                 FOR UPDATE SKIP LOCKED
-             )
+             UPDATE {schema}.workflows
+             SET redispatch_count = redispatch_count + 1, updated_at = now()
+             WHERE id = @id
+             RETURNING redispatch_count
              """;
 
         // Archive keeps a self-contained snapshot: the instance row plus its step trace, so a
@@ -435,6 +464,9 @@ internal sealed class WorkflowSql
 
     public string Schema { get; }
 
+    /// <summary>Schema holding the step queues, which the reconciliation sweep has to read.</summary>
+    public string QueueSchema { get; }
+
     public string Columns { get; }
 
     public string Insert { get; }
@@ -489,9 +521,9 @@ internal sealed class WorkflowSql
 
     public string DueSignalTimeouts { get; }
 
-    public string OrphanCandidates { get; }
+    public string ReconcileCandidates { get; }
 
-    public string ExhaustedRedispatch { get; }
+    public string BumpRedispatch { get; }
 
     public string ArchiveTerminal { get; }
 

@@ -152,6 +152,11 @@ A step returns:
 | `StepResult.Fail(reason)` | this will never work: fail immediately, no attempts wasted |
 | *throwing* | this attempt failed: roll back and retry with backoff, then fail |
 
+A step that throws **definitively** — its attempts run out, or it throws `PoisonMessageException` — fails its
+workflow, whichever way the engine finds out: the worker's own catch block, or the maintenance sweep reading
+the dead letter left behind by a host that was killed before it could report anything. A workflow never
+continues past a definitive throw.
+
 ---
 
 ## Driving workflows
@@ -199,7 +204,7 @@ attempt.
 dotnet test tests/LiteFlow.Tests        # needs Docker: Testcontainers brings up postgres:18-alpine
 ```
 
-31 tests against a real PostgreSQL, including a chaos run of 200 instances through a fleet that is repeatedly
+36 tests against a real PostgreSQL, including a chaos run of 200 instances through a fleet that is repeatedly
 stopped and hard-killed. They count *committed* effects, so they can tell "ran twice" from "took effect twice".
 [docs/DESIGN.md §6](docs/DESIGN.md#6-which-test-protects-which-guarantee) maps every guarantee to the test that
 pins it.

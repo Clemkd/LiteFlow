@@ -188,6 +188,29 @@ public static class WorkflowSchema
          """;
 
     /// <summary>
+    /// One index on the queue's dead-letter table, because the reconciliation sweep asks it a question its own
+    /// indexes do not answer: "is there a dead letter for this instance and this step?".
+    /// <para>
+    /// The lookup key is the step message's dedup key (<c>{instanceId:N}:{stepIndex}</c>), which makes the
+    /// match exact — and, with this index, a probe rather than a scan of every failure the system has ever
+    /// recorded. LiteFlow owns the queue registration, so the queue schema is its own implementation detail;
+    /// the statement is guarded so it does nothing when the queue tables are not there yet.
+    /// </para>
+    /// </summary>
+    public static string QueueLookupScript(string queueSchema = LiteQueue.QueueSchema.DefaultSchema) =>
+        $"""
+         DO $do$
+         BEGIN
+             IF to_regclass('{queueSchema}.dead_letters') IS NOT NULL THEN
+                 CREATE INDEX IF NOT EXISTS ix_dead_letters_dedup
+                     ON {queueSchema}.dead_letters (dedup_key)
+                     WHERE dedup_key IS NOT NULL;
+             END IF;
+         END
+         $do$;
+         """;
+
+    /// <summary>
     /// Storage tuning for the instance table. An instance row is updated once per step — cursor,
     /// state bag, timestamps — so a workflow of twenty steps produces twenty dead tuples. With stock
     /// autovacuum settings (vacuum at 20% of the table) a busy engine accumulates them faster than

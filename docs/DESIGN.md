@@ -61,6 +61,12 @@ workflow_archive          terminal instances, with their step trace as a jsonb s
 __liteflow_schema_version what the library expects to find, so it can upgrade itself
 ```
 
+LiteFlow also creates one index outside its own schema: `ix_dead_letters_dedup` on the queue's
+`dead_letters (dedup_key)`. The reconciliation sweep (§4.6) asks that table a question its own indexes do not
+answer — "is there a dead letter for this instance and this step?" — and without the index that lookup is a
+scan of every failure the system has ever recorded. LiteFlow owns the queue registration, so the queue schema
+is its implementation detail; the statement is guarded and does nothing if the queue tables are absent.
+
 Three choices worth defending:
 
 - **Partial indexes on live instances only** (`WHERE state < 4`). The indexes the dispatcher and the sweep walk
@@ -174,6 +180,24 @@ Throwing means "this attempt failed": the transaction rolls back and LiteQueue r
 backoff until the step's attempts run out. Returning `StepResult.Fail(reason)` means "this will never work" and
 fails the workflow immediately, without spending the remaining attempts proving it.
 
+**A step that throws definitively fails its workflow — whichever way the engine finds out.** "Definitively"
+covers every route: the configured attempts running out, a `PoisonMessageException`, a `WorkflowStateException`,
+or anything else that leaves the step unable to succeed. There is no path on which a workflow carries on past a
+definitive throw. Three mechanisms deliver that one guarantee:
+
+1. **The worker's own catch block** (the normal case). The step's exception is caught, the savepoint is rolled
+   back, and the verdict is written in the same transaction the fenced acknowledge commits — atomic with
+   consuming the message.
+2. **The verdict cannot be written** — the connection died, the host is going down, the transaction is
+   unusable. The worker gives up on reporting and lets the message take the queue's retry path; the message
+   eventually reaches the dead-letter table.
+3. **Nobody was left to report anything at all** — the host was killed at the last attempt, so the message's
+   lease simply expired and the queue dead-lettered it.
+
+In cases 2 and 3 the verdict comes from the reconciliation sweep (§4.6), which reads that dead letter and writes
+exactly the same state the worker would have: step `Failed`, and the workflow `Failed` (or `Compensating`, then
+`Failed`). The instance is never re-dispatched and never left `Running`.
+
 When a workflow ends badly and the definition declares compensations, the engine walks the completed steps in
 reverse, **one durable message per compensation**. So a crash during a rollback resumes the rollback rather
 than restarting it or abandoning it half-applied. Each compensation is guarded the same way as a step
@@ -216,13 +240,42 @@ there is no leader to elect and no cron to install:
 | due timers | a `Suspended` instance whose delayed message was lost |
 | expired waits | a `WaitForSignal` that timed out — fails (and rolls back) the instance |
 | parked cancellations | a cancellation asked for while the instance had nothing in flight |
-| orphans | a `Running` instance with no message in flight, after `OrphanGracePeriod` |
+| **reconciliation** | a live instance with **no message in flight** — see below |
 | retention | terminal instances to the archive, old archive rows away |
 
-Orphan recovery deserves a note: re-dispatching a step is a **no-op while a message for it still exists**,
-because the dedup key collides. So the sweep can offer steps back blindly and only ever recovers work that was
-genuinely lost (a dead-lettered message, a purged queue, a crash between a non-transactional step's commit and
-its acknowledge). After `MaxRedispatch` attempts it parks the instance instead of retrying forever.
+Reconciliation is the part worth reading twice, because getting it wrong breaks the guarantee in §4.3.
+
+The candidate set is every live instance that has **no message in flight** — an index probe against the queue's
+own unique dedup index, not a guess. For each candidate the sweep asks the queue *why*, and there are exactly two
+answers:
+
+- **A dead letter exists for this step**, newer than the instance's last progress. A worker ran the step, it
+  failed through its whole attempt budget, and the queue gave up on it — but no verdict was written. The sweep
+  writes it: step `Failed` with the dead letter's error as the cause, then the workflow `Failed` (rolling back
+  first if it has compensations). This instance is **never re-dispatched**.
+- **No dead letter either.** The message was genuinely lost — never enqueued because a host died in the wrong
+  microsecond, or removed by something outside the engine. This, and only this, is re-dispatched, and only after
+  `OrphanGracePeriod`. After `MaxRedispatch` re-dispatches that keep vanishing, the instance is parked in
+  `NeedsAttention`: that residual case means something outside the engine is eating its messages, which is a
+  human's problem.
+
+A dead letter for a *compensation* is treated differently: the instance is parked in `NeedsAttention` rather
+than reported as rolled back, because an incomplete rollback must not be dressed up as a complete one.
+
+Two earlier versions of this sweep were wrong, and both are now pinned by tests:
+
+- It re-dispatched every idle instance **blindly**, on the theory that the dedup key made that a no-op whenever a
+  message still existed. True for a message in flight; false for a dead-lettered one, which has *released* its
+  dedup key. So a step that had already thrown through its entire attempt budget was handed a brand-new budget,
+  up to `MaxRedispatch` times — the workflow carried on after a definitive failure, and ended in
+  `NeedsAttention` rather than `Failed` even then.
+- It counted a re-dispatch for **every** idle candidate, including instances whose step was merely queued behind
+  a busy fleet. Under sustained backlog those instances accumulated re-dispatch counts and were eventually
+  parked, while their step had never failed at all. The count is now incremented only when a message was really
+  put back.
+
+`Compensating` instances are swept the same way, so a rollback whose message dies is no longer stuck in
+`Compensating` forever.
 
 ---
 
@@ -240,8 +293,11 @@ its acknowledge). After `MaxRedispatch` attempts it parks the instance instead o
 7. **Starting is idempotent** given an idempotency key, and can be enrolled in the caller's transaction.
 8. **Cancellation is always honoured** — between steps unconditionally, during a step within the poll interval.
 9. **A rollback is durable**: compensations run in reverse, each resumable after a crash.
-10. **A changed definition never runs the wrong step.** It parks the instance instead.
-11. **No manual maintenance.** Timers, timeouts, lost steps and retention are swept automatically, with no
+10. **A step that throws definitively fails its workflow**, whichever way the engine finds out — the worker's own
+    catch block, a dead letter left by a host that died before it could report, or a payload nobody could read. A
+    workflow never continues past a definitive throw, and never sits in `Running` with a dead-lettered step.
+11. **A changed definition never runs the wrong step.** It parks the instance instead.
+12. **No manual maintenance.** Timers, timeouts, lost steps and retention are swept automatically, with no
     leader election.
 
 ### What it does not guarantee — read this part
@@ -304,8 +360,13 @@ count. That is what lets the assertions distinguish "ran twice" from "took effec
 | Attempts exhausted → failed + reverse rollback (9) | `FailureTests.A_step_that_keeps_throwing_fails_the_workflow_and_rolls_it_back_in_reverse_order` |
 | `Fail` does not burn attempts | `FailureTests.A_step_that_refuses_fails_immediately_without_burning_its_attempts` |
 | An interrupted rollback resumes (9) | `FailureTests.An_interrupted_rollback_resumes_where_it_stopped` |
+| Attempts exhausted with **no worker left to report it** (10) | `DeadLetterTests.A_step_that_throws_until_its_attempts_run_out_fails_the_workflow_even_when_no_worker_reports_it` |
+| A poison step fails immediately and stays failed (10) | `DeadLetterTests.A_step_that_declares_itself_poison_fails_the_workflow_immediately` |
+| A dead-lettered step is never re-dispatched (10) | `DeadLetterTests.The_sweep_never_re_dispatches_a_step_whose_message_was_dead_lettered` |
+| A genuinely lost message still is re-dispatched (12) | `DeadLetterTests.The_sweep_re_dispatches_a_step_whose_message_was_genuinely_lost` |
+| A dead-lettered compensation parks rather than loops | `DeadLetterTests.A_dead_lettered_compensation_parks_the_workflow_instead_of_looping` |
 | A failed workflow can be resumed | `FailureTests.A_failed_workflow_can_be_resumed_at_the_step_that_failed` |
-| Definition drift parks, resume re-anchors (10) | `DefinitionDriftTests.An_instance_whose_step_moved_is_parked_and_can_be_re_anchored_by_name` |
+| Definition drift parks, resume re-anchors (11) | `DefinitionDriftTests.An_instance_whose_step_moved_is_parked_and_can_be_re_anchored_by_name` |
 | Two definitions cannot share a name | `DefinitionDriftTests.Two_workflows_cannot_share_a_name` |
 | Duplicate step names are refused at startup | `DefinitionDriftTests.A_definition_with_two_steps_of_the_same_name_is_refused_at_startup` |
 | Idempotent start (7) | `StartTests.Starting_twice_with_the_same_key_returns_the_first_instance` |
@@ -329,8 +390,9 @@ step's transaction, and it fails with duplicate executions.
   renewal keeps a longer step alive, but a lease shorter than a step means every takeover re-runs work.
 - **`MaintenanceInterval`** (default 15 s) bounds how fast due timers, expired waits and parked cancellations
   are noticed.
-- **`OrphanGracePeriod`** (default 5 min) must be longer than your slowest step, or the sweep will offer steps
-  back while they are legitimately running. It is harmless — the dedup key absorbs it — but it is noise.
+- **`OrphanGracePeriod`** (default 5 min) delays only the re-dispatch of instances with *nothing* in flight.
+  An instance whose step is running, or whose message is queued, is not a candidate at all, so this no longer has
+  to be tuned against your slowest step; it is a margin, not a correctness knob.
 - **Supervision**: `GetStatsAsync` per definition, or
   `SELECT state, count(*) FROM liteflow.workflows GROUP BY state`. Two numbers matter: `NeedsAttention` should
   always be zero, and `OldestLiveAge` is the engine's real latency signal.

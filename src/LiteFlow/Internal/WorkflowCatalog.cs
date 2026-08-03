@@ -20,7 +20,7 @@ internal sealed class WorkflowCatalog(LiteFlowOptions options)
 
     public LiteFlowOptions Options { get; } = options;
 
-    public WorkflowSql Sql { get; } = new(options.Schema);
+    public WorkflowSql Sql { get; } = new(options.Schema, options.QueueSchema);
 
     public IReadOnlyCollection<WorkflowDefinition> Definitions => _byName.Values;
 
@@ -80,6 +80,11 @@ internal sealed class WorkflowCatalog(LiteFlowOptions options)
             await WorkflowCommands.ExecuteScriptAsync(target, WorkflowSchema.CreateScript(Options.Schema), ct);
             if (Options.ApplyStorageTuning)
                 await WorkflowCommands.ExecuteScriptAsync(target, WorkflowSchema.TuningScript(Options.Schema), ct);
+
+            // The reconciliation sweep looks a step up in the queue's dead letters by dedup key; without
+            // this index that lookup degrades to a scan of every failure ever recorded.
+            await WorkflowCommands.ExecuteScriptAsync(
+                target, WorkflowSchema.QueueLookupScript(Options.QueueSchema), ct);
 
             _initialized = true;
         }

@@ -25,7 +25,13 @@ public sealed class FencingTests(PostgresFixture fixture)
                 w.Lease = TimeSpan.FromSeconds(3);
                 w.RenewLease = false;
             }),
-            o => o.MaintenanceInterval = TimeSpan.FromSeconds(1));
+            o =>
+            {
+                o.MaintenanceInterval = TimeSpan.FromSeconds(1);
+                // Generous, so the rounds the zombie loses to its own lease cannot exhaust the step and turn
+                // this into a test about dead letters (DeadLetterTests covers that).
+                o.MaxStepAttempts = 20;
+            });
 
         // The worker that legitimately takes the step over, with a lease it keeps alive.
         await using var successor = fixture.BuildProvider(
@@ -34,7 +40,11 @@ public sealed class FencingTests(PostgresFixture fixture)
                 w.Concurrency = 1;
                 w.Lease = TimeSpan.FromSeconds(30);
             }),
-            o => o.MaintenanceInterval = TimeSpan.FromSeconds(1));
+            o =>
+            {
+                o.MaintenanceInterval = TimeSpan.FromSeconds(1);
+                o.MaxStepAttempts = 20;
+            });
 
         var zombieScript = zombie.GetRequiredService<StepScript>();
         var successorScript = successor.GetRequiredService<StepScript>();
@@ -70,15 +80,22 @@ public sealed class FencingTests(PostgresFixture fixture)
         // Only now does the successor come up, so the first attempt is unambiguously the zombie's.
         var successorWorkers = await TestHelpers.StartWorkersAsync(successor);
 
+        // Wait for the zombie's attempt to finish and have its acknowledge refused — that is the behaviour
+        // under test — then take the zombie out of the picture.
+        //
+        // It has to go, and not just because it has made its point: every attempt it makes outlives its lease,
+        // so leaving it running means it keeps claiming the step and burning the message's attempt budget. Once
+        // that budget is gone the queue dead-letters the message, and the engine (rightly) declares the step
+        // definitively failed. Whether the successor gets a turn before that would be a race — so the test does
+        // not run one.
+        await zombieReturned.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await Task.Delay(TimeSpan.FromSeconds(1));
+        await TestHelpers.StopWorkersAsync(zombieWorkers);
+
         var finished = await TestHelpers.WaitForTerminalAsync(
             successor, handle.WorkflowId, TimeSpan.FromSeconds(90));
 
-        // Let the zombie finish and have its acknowledge refused before looking at the rows.
-        await zombieReturned.Task.WaitAsync(TimeSpan.FromSeconds(30));
-        await Task.Delay(TimeSpan.FromSeconds(2));
-
         await TestHelpers.StopWorkersAsync(successorWorkers);
-        await TestHelpers.StopWorkersAsync(zombieWorkers);
 
         Assert.Equal(WorkflowState.Completed, finished.State);
 

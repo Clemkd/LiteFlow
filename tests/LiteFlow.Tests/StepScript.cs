@@ -188,6 +188,83 @@ public static class TestDb
         return duplicates;
     }
 
+    /// <summary>
+    /// Messages still in flight for one step of one instance, matched on the dedup key the engine uses. The
+    /// assertion behind "the sweep did not re-dispatch it".
+    /// </summary>
+    public static async Task<int> PendingMessagesAsync(
+        string connectionString, Guid workflowId, int stepIndex, bool compensation = false)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT count(*) FROM litequeue.messages WHERE dedup_key = @key";
+        cmd.Parameters.AddWithValue("key", DedupKey(workflowId, stepIndex, compensation));
+        return Convert.ToInt32(await cmd.ExecuteScalarAsync());
+    }
+
+    /// <summary>Dead letters recorded for one step of one instance.</summary>
+    public static async Task<int> DeadLettersAsync(
+        string connectionString, Guid workflowId, int stepIndex, bool compensation = false)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT count(*) FROM litequeue.dead_letters WHERE dedup_key = @key";
+        cmd.Parameters.AddWithValue("key", DedupKey(workflowId, stepIndex, compensation));
+        return Convert.ToInt32(await cmd.ExecuteScalarAsync());
+    }
+
+    /// <summary>
+    /// Remove the message a step is waiting on, without telling the engine — the "an incident lost it" state
+    /// the reconciliation sweep exists to repair.
+    /// </summary>
+    public static async Task DropMessageAsync(
+        string connectionString, Guid workflowId, int stepIndex, bool compensation = false)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM litequeue.messages WHERE dedup_key = @key";
+        cmd.Parameters.AddWithValue("key", DedupKey(workflowId, stepIndex, compensation));
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// Record a dead letter for one step of one instance, exactly as the queue would after a worker exhausted
+    /// it — the state a host that died at the last attempt leaves behind.
+    /// </summary>
+    public static async Task RecordDeadLetterAsync(
+        string connectionString, string queueName, Guid workflowId, int stepIndex, string error,
+        int attempts = 2, bool compensation = false)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            """
+            INSERT INTO litequeue.dead_letters
+                (message_id, queue_id, message_type, payload, priority, attempts, max_attempts,
+                 enqueued_at, error, dedup_key)
+            SELECT 0, q.id, @type, ''::bytea, 0, @attempts, @attempts, now(), @error, @key
+            FROM litequeue.queues q
+            WHERE q.name = @queue
+            """;
+        cmd.Parameters.AddWithValue("type", "test/dead-letter");
+        cmd.Parameters.AddWithValue("attempts", attempts);
+        cmd.Parameters.AddWithValue("error", error);
+        cmd.Parameters.AddWithValue("key", DedupKey(workflowId, stepIndex, compensation));
+        cmd.Parameters.AddWithValue("queue", queueName);
+
+        int inserted = await cmd.ExecuteNonQueryAsync();
+        if (inserted != 1)
+            throw new InvalidOperationException($"Queue '{queueName}' does not exist, so no dead letter was recorded.");
+    }
+
+    /// <summary>The dedup key the engine derives for a step message — the join key the sweep reconciles on.</summary>
+    public static string DedupKey(Guid workflowId, int stepIndex, bool compensation = false) =>
+        compensation ? $"{workflowId:N}:c{stepIndex}" : $"{workflowId:N}:{stepIndex}";
+
     private static async Task<int> ScalarAsync(
         string connectionString, string sql, Guid workflowId, string? step)
     {

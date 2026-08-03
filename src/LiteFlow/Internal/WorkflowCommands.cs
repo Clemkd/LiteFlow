@@ -107,6 +107,36 @@ internal sealed record WorkflowRow
 /// <summary>An instance whose current step has to be (re)dispatched.</summary>
 internal sealed record DispatchTarget(Guid Id, string Definition, int StepIndex, string StepName, int Priority);
 
+/// <summary>
+/// A live instance with no message in flight, and what the queue says about it.
+/// <para>
+/// <see cref="DeadLetterKey"/> is the decisive field: when it is set, a worker got as far as exhausting this
+/// step (or this compensation) and the queue gave up on it, so the instance must be failed — never retried. Its
+/// shape also says which of the two it was: a compensation's dedup key carries <c>:c</c>.
+/// </para>
+/// </summary>
+internal sealed record ReconcileTarget(
+    Guid Id,
+    string Definition,
+    WorkflowState State,
+    int CurrentStep,
+    string CurrentStepName,
+    int Priority,
+    int? CompensationIndex,
+    int RedispatchCount,
+    bool Redispatchable,
+    string? DeadLetterKey,
+    string? DeadLetterError,
+    int DeadLetterAttempts)
+{
+    /// <summary><c>true</c> when the dead letter is a compensation's rather than a step's.</summary>
+    public bool DeadLetterIsCompensation =>
+        DeadLetterKey is not null && DeadLetterKey.Contains(":c", StringComparison.Ordinal);
+
+    public DispatchTarget ToDispatchTarget() =>
+        new(Id, Definition, CurrentStep, CurrentStepName, Priority);
+}
+
 /// <summary>An instance whose wait for a signal has expired.</summary>
 internal sealed record ExpiredWait(Guid Id, string Definition, int StepIndex, string StepName, string? Signal);
 
@@ -484,26 +514,44 @@ internal static class WorkflowCommands
         return await ReadTargetsAsync(cmd, ct);
     }
 
-    public static async Task<List<DispatchTarget>> OrphanCandidatesAsync(
-        SqlTarget target, WorkflowSql sql, TimeSpan grace, int maxRedispatch, int max, CancellationToken ct)
+    public static async Task<List<ReconcileTarget>> ReconcileCandidatesAsync(
+        SqlTarget target, WorkflowSql sql, TimeSpan grace, int max, CancellationToken ct)
     {
         await using var cmd = target.CreateCommand();
-        cmd.CommandText = sql.OrphanCandidates;
+        cmd.CommandText = sql.ReconcileCandidates;
         Add(cmd, "grace", grace.TotalSeconds, DbType.Double);
-        Add(cmd, "max_redispatch", maxRedispatch, DbType.Int32);
         Add(cmd, "max", max, DbType.Int32);
-        return await ReadTargetsAsync(cmd, ct);
+
+        var candidates = new List<ReconcileTarget>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            candidates.Add(new ReconcileTarget(
+                Id: reader.GetGuid(0),
+                Definition: reader.GetString(1),
+                State: (WorkflowState)Convert.ToInt32(reader.GetValue(2)),
+                CurrentStep: reader.GetInt32(3),
+                CurrentStepName: reader.GetString(4),
+                Priority: reader.GetInt32(5),
+                CompensationIndex: reader.IsDBNull(6) ? null : reader.GetInt32(6),
+                RedispatchCount: reader.GetInt32(7),
+                Redispatchable: reader.GetBoolean(8),
+                DeadLetterKey: reader.IsDBNull(9) ? null : reader.GetString(9),
+                DeadLetterError: reader.IsDBNull(10) ? null : reader.GetString(10),
+                DeadLetterAttempts: reader.IsDBNull(11) ? 0 : reader.GetInt32(11)));
+        }
+        return candidates;
     }
 
-    public static async Task<int> ExhaustedRedispatchAsync(
-        SqlTarget target, WorkflowSql sql, TimeSpan grace, int maxRedispatch, string error, CancellationToken ct)
+    /// <summary>Count one re-dispatch and return the new total, so the caller can stop after too many.</summary>
+    public static async Task<int> BumpRedispatchAsync(
+        SqlTarget target, WorkflowSql sql, Guid id, CancellationToken ct)
     {
         await using var cmd = target.CreateCommand();
-        cmd.CommandText = sql.ExhaustedRedispatch;
-        Add(cmd, "grace", grace.TotalSeconds, DbType.Double);
-        Add(cmd, "max_redispatch", maxRedispatch, DbType.Int32);
-        Add(cmd, "error", error, DbType.String);
-        return await cmd.ExecuteNonQueryAsync(ct);
+        cmd.CommandText = sql.BumpRedispatch;
+        Add(cmd, "id", id, DbType.Guid);
+        var value = await cmd.ExecuteScalarAsync(ct);
+        return value is null or DBNull ? 0 : Convert.ToInt32(value);
     }
 
     public static async Task<List<ExpiredWait>> DueSignalTimeoutsAsync(

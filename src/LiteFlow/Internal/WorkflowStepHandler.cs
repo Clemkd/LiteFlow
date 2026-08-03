@@ -508,8 +508,8 @@ internal abstract class WorkflowStepHandlerBase(
                 row.Id, payload.StepIndex, payload.StepName);
         }
 
-        var previous = await FindCompensableAsync(
-            target, definition, row.Id, payload.StepIndex - 1, cancellationToken);
+        var previous = await WorkflowTermination.FindCompensableAsync(
+            target, Sql, definition, row.Id, payload.StepIndex - 1, cancellationToken);
 
         if (previous is null)
         {
@@ -541,23 +541,17 @@ internal abstract class WorkflowStepHandlerBase(
         string? stateJson,
         CancellationToken cancellationToken)
     {
-        var compensable = await FindCompensableAsync(
-            target, definition, row.Id, row.CurrentStep, cancellationToken);
+        var written = await WorkflowTermination.TerminateAsync(
+            target, Sql, producer, catalog, definition, row, finalState, error, stateJson, WorkerId,
+            cancellationToken);
 
-        if (compensable is null)
-        {
-            await FinishAsync(target, definition, row, finalState, stateJson, error, cancellationToken);
-            return;
-        }
-
-        await WorkflowCommands.StartCompensationAsync(
-            target, Sql, row.Id, compensable.Index, error, cancellationToken);
-        await StepDispatcher.DispatchCompensationAsync(
-            producer, definition, row.Id, compensable,
-            row.Priority + compensable.Priority, catalog.MaxAttemptsFor(compensable), cancellationToken);
-
-        logger.LogInformation(
-            "Workflow {WorkflowId} is rolling back, starting at step {Step}.", row.Id, compensable.Name);
+        if (written == WorkflowState.Compensating)
+            logger.LogInformation("Workflow {WorkflowId} is rolling back.", row.Id);
+        else
+            logger.Log(
+                written == WorkflowState.Completed ? LogLevel.Information : LogLevel.Warning,
+                "Workflow {Definition} {WorkflowId} is {State}{Error}.",
+                definition.Name, row.Id, written, error is null ? "" : $": {error}");
     }
 
     private async Task FinishAsync(
@@ -577,30 +571,6 @@ internal abstract class WorkflowStepHandlerBase(
             state == WorkflowState.Completed ? LogLevel.Information : LogLevel.Warning,
             "Workflow {Definition} {WorkflowId} is {State}{Error}.",
             definition.Name, row.Id, state, error is null ? "" : $": {error}");
-    }
-
-    /// <summary>Highest completed step at or below <paramref name="maxIndex"/> that can be undone.</summary>
-    private async Task<WorkflowStepDescriptor?> FindCompensableAsync(
-        SqlTarget target, WorkflowDefinition definition, Guid workflowId, int maxIndex, CancellationToken ct)
-    {
-        if (maxIndex < 0)
-            return null;
-
-        var steps = await WorkflowCommands.ListStepsAsync(target, Sql, workflowId, ct);
-
-        for (int i = steps.Count - 1; i >= 0; i--)
-        {
-            var record = steps[i];
-            if (record.StepIndex > maxIndex || record.State != StepState.Completed)
-                continue;
-
-            var descriptor = definition.StepAt(record.StepIndex);
-            if (descriptor is { HasCompensation: true }
-                && string.Equals(descriptor.Name, record.StepName, StringComparison.Ordinal))
-                return descriptor;
-        }
-
-        return null;
     }
 
     private async Task ParkAsync(
