@@ -8,7 +8,7 @@ step is tracked. Its single reason to exist is the sentence a durable engine has
 
 Everything below is in service of that sentence, and section 5 is honest about where it stops.
 
-It is built on [LiteQueue](../../LiteQueue): a step is a queue message, and the lease, heartbeat, retry and
+It is built on [LiteQueue](https://github.com/Clemkd/LiteQueue): a step is a queue message, and the lease, heartbeat, retry and
 fenced-acknowledge machinery is LiteQueue's. LiteFlow adds the notion of a *sequence* — a cursor, a state bag,
 and the rules for moving from one step to the next without ever moving twice.
 

@@ -19,7 +19,7 @@ public sealed class OrderWorkflow : Workflow<OrderState>
 }
 ```
 
-Built on [LiteQueue](../LiteQueue) for dispatch, leases and retries.
+Built on [LiteQueue](https://github.com/Clemkd/LiteQueue) for dispatch, leases and retries.
 
 ---
 
